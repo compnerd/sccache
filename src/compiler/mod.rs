@@ -26,6 +26,7 @@ mod nvcc;
 mod nvhpc;
 mod preprocessor_cache;
 mod rust;
+mod swift;
 mod tasking_vx;
 #[macro_use]
 mod counted_array;

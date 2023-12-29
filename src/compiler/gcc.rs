@@ -645,6 +645,7 @@ fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
         Language::Cuda => Some("cu"),
         Language::Rust => None,          // Let the compiler decide
         Language::GenericHeader => None, // Let the compiler decide
+        Language::Swift => None,         // Let the compiler decide
     }
 }
 

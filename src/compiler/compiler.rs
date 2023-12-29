@@ -25,6 +25,7 @@ use crate::compiler::nvcc::Nvcc;
 use crate::compiler::nvcc::NvccHostCompiler;
 use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::rust::{Rust, RustupProxy};
+use crate::compiler::swift::Swift;
 use crate::compiler::tasking_vx::TaskingVX;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
@@ -100,6 +101,8 @@ pub enum CompilerKind {
     C(CCompilerKind),
     /// A Rust compiler.
     Rust,
+    /// A Swift compiler.
+    Swift,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -113,6 +116,7 @@ pub enum Language {
     ObjectiveCxx,
     Cuda,
     Rust,
+    Swift,
 }
 
 impl Language {
@@ -135,6 +139,7 @@ impl Language {
             Some("cu") => Some(Language::Cuda),
             // TODO cy
             Some("rs") => Some(Language::Rust),
+            Some("swift") => Some(Language::Swift),
             e => {
                 trace!("Unknown source extension: {}", e.unwrap_or("(None)"));
                 None
@@ -151,6 +156,7 @@ impl Language {
             Language::ObjectiveCxx => "objc++",
             Language::Cuda => "cuda",
             Language::Rust => "rust",
+            Language::Swift => "swift",
         }
     }
 }
@@ -167,6 +173,7 @@ impl CompilerKind {
             | Language::ObjectiveCxx => "C/C++",
             Language::Cuda => "CUDA",
             Language::Rust => "Rust",
+            Language::Swift => "Swift",
         }
         .to_string()
     }
@@ -181,6 +188,7 @@ impl CompilerKind {
             CompilerKind::C(CCompilerKind::Nvcc) => textual_lang + " [nvcc]",
             CompilerKind::C(CCompilerKind::TaskingVX) => textual_lang + " [taskingvx]",
             CompilerKind::Rust => textual_lang,
+            CompilerKind::Swift => textual_lang,
         }
     }
 }
@@ -980,6 +988,16 @@ fn is_rustc_like<P: AsRef<Path>>(p: P) -> bool {
     )
 }
 
+fn is_swiftc_like<P: AsRef<Path>>(p: P) -> bool  {
+    matches!(
+        p.as_ref()
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .as_deref(),
+        Some("swift-frontend") | Some("swiftc")
+    )
+}
+
 /// If `executable` is a known compiler, return `Some(Box<Compiler>)`.
 async fn detect_compiler<T>(
     creator: T,
@@ -1013,6 +1031,14 @@ where
                 None
             }
         })
+    } else {
+        None
+    };
+
+    // Second, see if this looks like swiftc.
+
+    let swiftc_executable = if is_swiftc_like(executable) {
+        Some(executable.to_path_buf())
     } else {
         None
     };
@@ -1110,6 +1136,34 @@ where
                         proxy as Option<Box<dyn CompilerProxy<T>>>,
                     )
                 })
+            }
+            Err(e) => Err(e).context("Failed to launch subprocess for compiler determination"),
+        }
+    } else if let Some(swiftc_executable) = swiftc_executable {
+        // Sanity check that it's really swiftc.
+        let mut child = creator.clone().new_command_sync(executable);
+        child.env_clear().envs(ref_env(env)).args(&["--version"]);
+        let swiftc_version = run_input_output(child, None).await.map(|output| {
+            if let Ok(stdout) = String::from_utf8(output.stdout.clone()) {
+                if stdout.contains("Swift version") {
+                    return Ok(stdout);
+                }
+            }
+            Err(ProcessError(output))
+        })?;
+        match swiftc_version {
+            Ok(swiftc_version) => {
+                debug!("Using swiftc at path: {swiftc_executable:?}");
+                Swift::new(
+                    creator,
+                    swiftc_executable,
+                    env,
+                    &swiftc_version,
+                    dist_archive,
+                    pool,
+                )
+                .await
+                .map(|c| { (Box::new(c) as Box<dyn Compiler<T>>, None) })
             }
             Err(e) => Err(e).context("Failed to launch subprocess for compiler determination"),
         }
@@ -1508,6 +1562,30 @@ mod test {
             .unwrap()
             .0;
         assert_eq!(CompilerKind::Rust, c.kind());
+    }
+
+    #[test]
+    fn test_detect_compiler_kind_swiftc() {
+        let f = TestFixture::new();
+        let creator = new_creator();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        // swiftc --version
+        next_command(
+            &creator,
+            Ok(MockChild::new(
+                exit_status(0),
+                "\
+compnerd.org Swift version 5.11-dev (LLVM 13124099c3f0229, Swift f08f86c71617bac)
+Target: aarch64-unknown-windows-msvc",
+                "",
+            )),
+        );
+        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
+            .wait()
+            .unwrap()
+            .0;
+        assert_eq!(CompilerKind::Swift, c.kind());
     }
 
     #[test]
